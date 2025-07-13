@@ -3,6 +3,8 @@ import logging
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
+from torch.profiler import profile, ProfilerActivity
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -74,27 +76,41 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         prefill_total_tokens = decode_total_tokens = 0
         prefill_total_time = decode_total_time = 0.
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            elapsed = perf_counter() - t
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_total_tokens += num_tokens
-                    prefill_total_time += elapsed
-                    prefill_throughput = prefill_total_tokens / prefill_total_time if prefill_total_time > 0 else 0
-                else:
-                    decode_total_tokens -= num_tokens
-                    decode_total_time += elapsed
-                    decode_throughput = decode_total_tokens / decode_total_time if decode_total_time > 0 else 0
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+        
+        torch.cuda.synchronize()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=5, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        ) as prof:
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens = self.step()
+                elapsed = perf_counter() - t
                 if use_tqdm:
-                    pbar.update(1)
+                    if num_tokens > 0:
+                        prefill_total_tokens += num_tokens
+                        prefill_total_time += elapsed
+                        prefill_throughput = prefill_total_tokens / prefill_total_time if prefill_total_time > 0 else 0
+                    else:
+                        decode_total_tokens -= num_tokens
+                        decode_total_time += elapsed
+                        decode_throughput = decode_total_tokens / decode_total_time if decode_total_time > 0 else 0
+                    pbar.set_postfix({
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    })
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    if use_tqdm:
+                        pbar.update(1)
+                prof.step()
+        torch.cuda.synchronize()
+        print(prof.key_averages().table(
+            sort_by="cuda_time_total", row_limit=20
+        ))
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
