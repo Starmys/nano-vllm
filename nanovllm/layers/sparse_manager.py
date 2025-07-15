@@ -5,31 +5,8 @@ import triton.language as tl
 
 torch._dynamo.config.capture_scalar_outputs = True
 
-def num_splits_heuristic(total_mblocks, max_splits):
-    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
-    num_sm = props.multi_processor_count
-    if total_mblocks >= 0.8 * num_sm:
-        return 1
-    
-    max_efficiency = 0.0
-    efficiency = []
-
-    # Compute efficiency for different splits
-    for num_splits in range(1, max_splits + 1):
-        n_waves = (total_mblocks * num_splits) / num_sm
-        eff = n_waves / math.ceil(n_waves)
-        # Track max efficiency
-        if eff > max_efficiency:
-            max_efficiency = eff
-
-        efficiency.append(eff)
-
-    # Find the smallest number of splits that achieves at least 85% of max efficiency
-    for num_splits in range(1, max_splits + 1):
-        if efficiency[num_splits - 1] >= 0.95 * max_efficiency:
-            return num_splits
-
-    return 1
+def num_splits_heuristic(total_mblocks, max_blocks=1024, max_splits=256):
+    return max(1, min(triton.cdiv(max_blocks, total_mblocks), max_splits))
 
 @triton.autotune(
     configs=[
@@ -98,8 +75,7 @@ def block_attention(q, k_min, k_max, num_blocks, local_num_blocks, block_tables,
     attn_score = torch.zeros((batch, n_kv_heads, max_num_blocks), device=q.device, dtype=torch.float32)
     BLOCK_N = 32
     BLOCK_PAGE = BLOCK_N // indices_per_page
-    # num_splits = num_splits_heuristic(batch * n_kv_heads, max_splits=256)
-    num_splits = 128
+    num_splits = num_splits_heuristic(batch * n_kv_heads)
     assert BLOCK_N % indices_per_page == 0, "BLOCK_N should be divisible by indices_per_page"
     grid = (batch, n_kv_heads, num_splits)
     with torch.cuda.device(q.device.index): 
